@@ -39,7 +39,15 @@ func newConnTrackKey(addr *net.UDPAddr) *connTrackKey {
 	}
 }
 
-type connTrackMap map[connTrackKey]*net.UDPConn
+// connTrackEntry is a tracked proxied connection. Each entry carries a
+// unique generation so that the replyLoop which owns it can be told apart
+// from any newer connection tracked for the same client.
+type connTrackEntry struct {
+	conn *net.UDPConn
+	gen  uint64
+}
+
+type connTrackMap map[connTrackKey]*connTrackEntry
 
 // UDPProxy is proxy for which handles UDP datagrams. It implements the Proxy
 // interface to handle UDP traffic forwarding between the frontend and backend
@@ -51,6 +59,15 @@ type UDPProxy struct {
 	backendAddr    *net.UDPAddr
 	connTrackTable connTrackMap
 	connTrackLock  sync.Mutex
+	// connTrackTimeout is the idle timeout applied to tracked connections.
+	// It defaults to UDPConnTrackTimeout.
+	connTrackTimeout time.Duration
+	// nextGen is the generation counter for tracked connections. It is
+	// guarded by connTrackLock.
+	nextGen uint64
+	// closed reports whether Close has been called. It is guarded by
+	// connTrackLock.
+	closed bool
 }
 
 // NewUDPProxy creates a new UDPProxy.
@@ -61,11 +78,12 @@ func NewUDPProxy(frontendAddr, backendAddr *net.UDPAddr, ops ...func(*UDPProxy))
 	}
 
 	proxy := &UDPProxy{
-		listener:       listener,
-		frontendAddr:   listener.LocalAddr().(*net.UDPAddr),
-		backendAddr:    backendAddr,
-		connTrackTable: make(connTrackMap),
-		Logger:         &noopLogger{},
+		listener:         listener,
+		frontendAddr:     listener.LocalAddr().(*net.UDPAddr),
+		backendAddr:      backendAddr,
+		connTrackTable:   make(connTrackMap),
+		connTrackTimeout: UDPConnTrackTimeout,
+		Logger:           &noopLogger{},
 	}
 
 	for _, op := range ops {
@@ -75,26 +93,34 @@ func NewUDPProxy(frontendAddr, backendAddr *net.UDPAddr, ops ...func(*UDPProxy))
 	return proxy, nil
 }
 
-func (proxy *UDPProxy) replyLoop(proxyConn *net.UDPConn, clientAddr *net.UDPAddr, clientKey *connTrackKey) {
+func (proxy *UDPProxy) replyLoop(entry *connTrackEntry, clientAddr *net.UDPAddr, clientKey *connTrackKey) {
 	defer func() {
+		// Only clean up the tracked entry if it is still the generation
+		// this loop belongs to. A newer connection for the same client
+		// may have been tracked since; it belongs to another loop and is
+		// not ours to remove or close.
 		proxy.connTrackLock.Lock()
-		delete(proxy.connTrackTable, *clientKey)
+		if current, ok := proxy.connTrackTable[*clientKey]; ok && current.gen == entry.gen {
+			delete(proxy.connTrackTable, *clientKey)
+			proxy.connTrackLock.Unlock()
+			_ = entry.conn.Close()
+			return
+		}
 		proxy.connTrackLock.Unlock()
-		_ = proxyConn.Close()
 	}()
 
 	readBuf := make([]byte, UDPBufSize)
 	for {
-		_ = proxyConn.SetReadDeadline(time.Now().Add(UDPConnTrackTimeout))
+		_ = entry.conn.SetReadDeadline(time.Now().Add(proxy.connTrackTimeout))
 	again:
-		read, err := proxyConn.Read(readBuf)
+		read, err := entry.conn.Read(readBuf)
 		if err != nil {
 			if err, ok := err.(*net.OpError); ok && err.Err == syscall.ECONNREFUSED {
 				// This will happen if the last write failed
 				// (e.g: nothing is actually listening on the
 				// proxied port on the container), ignore it
-				// and continue until UDPConnTrackTimeout
-				// expires:
+				// and continue until the connection track
+				// timeout expires:
 				goto again
 			}
 			return
@@ -125,20 +151,26 @@ func (proxy *UDPProxy) Run() {
 
 		fromKey := newConnTrackKey(from)
 		proxy.connTrackLock.Lock()
-		proxyConn, hit := proxy.connTrackTable[*fromKey]
+		if proxy.closed {
+			proxy.connTrackLock.Unlock()
+			return
+		}
+		entry, hit := proxy.connTrackTable[*fromKey]
 		if !hit {
-			proxyConn, err = net.DialUDP("udp", nil, proxy.backendAddr)
+			proxyConn, err := net.DialUDP("udp", nil, proxy.backendAddr)
 			if err != nil {
 				proxy.Logger.Printf("Can't proxy a datagram to udp/%s: %s\n", proxy.backendAddr, err)
 				proxy.connTrackLock.Unlock()
 				continue
 			}
-			proxy.connTrackTable[*fromKey] = proxyConn
-			go proxy.replyLoop(proxyConn, from, fromKey)
+			proxy.nextGen++
+			entry = &connTrackEntry{conn: proxyConn, gen: proxy.nextGen}
+			proxy.connTrackTable[*fromKey] = entry
+			go proxy.replyLoop(entry, from, fromKey)
 		}
 		proxy.connTrackLock.Unlock()
 		for i := 0; i != read; {
-			written, err := proxyConn.Write(readBuf[i:read])
+			written, err := entry.conn.Write(readBuf[i:read])
 			if err != nil {
 				proxy.Logger.Printf("Can't proxy a datagram to udp/%s: %s\n", proxy.backendAddr, err)
 				break
@@ -148,13 +180,23 @@ func (proxy *UDPProxy) Run() {
 	}
 }
 
-// Close stops forwarding the traffic.
+// Close stops forwarding the traffic. It is safe to call multiple times and
+// concurrently with the connection-tracking loops: every tracked connection
+// is closed exactly once, either by Close or by the replyLoop that owns it,
+// whichever removes it from the tracking table first.
 func (proxy *UDPProxy) Close() {
 	_ = proxy.listener.Close()
 	proxy.connTrackLock.Lock()
-	defer proxy.connTrackLock.Unlock()
-	for _, conn := range proxy.connTrackTable {
-		_ = conn.Close()
+	if proxy.closed {
+		proxy.connTrackLock.Unlock()
+		return
+	}
+	proxy.closed = true
+	table := proxy.connTrackTable
+	proxy.connTrackTable = make(connTrackMap)
+	proxy.connTrackLock.Unlock()
+	for _, entry := range table {
+		_ = entry.conn.Close()
 	}
 }
 
